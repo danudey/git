@@ -318,6 +318,55 @@ test_expect_success 'cannot start multiple daemons' '
 	test_must_fail git -C test_multiple fsmonitor--daemon status
 '
 
+# Wait up to $2 seconds for the daemon in repo $1 to exit on its own.
+wait_for_daemon_exit () {
+	r=$1 &&
+	n=$2 &&
+	while test $n -gt 0
+	do
+		git -C $r fsmonitor--daemon status >/dev/null 2>&1 || return 0
+		sleep 1
+		n=$(($n - 1))
+	done
+	return 1
+}
+
+test_expect_success 'daemon exits after fsmonitor.idleTimeout' '
+	test_when_finished "stop_daemon_delete_repo test_idle" &&
+
+	git init test_idle &&
+	git -C test_idle config fsmonitor.idleTimeout 2 &&
+	start_daemon -C test_idle &&
+
+	wait_for_daemon_exit test_idle 20
+'
+
+test_expect_success 'client requests reset the idle timer' '
+	test_when_finished "stop_daemon_delete_repo test_idle_reset" &&
+
+	git init test_idle_reset &&
+	git -C test_idle_reset config fsmonitor.idleTimeout 3 &&
+	start_daemon -C test_idle_reset &&
+
+	for i in 1 2 3 4 5
+	do
+		sleep 1 &&
+		test-tool -C test_idle_reset fsmonitor-client query \
+			--token 0 >/dev/null || return 1
+	done &&
+	git -C test_idle_reset fsmonitor--daemon status &&
+
+	wait_for_daemon_exit test_idle_reset 20
+'
+
+test_expect_success 'fsmonitor.idleTimeout rejects negative values' '
+	test_when_finished "rm -rf test_idle_neg" &&
+	git init test_idle_neg &&
+	git -C test_idle_neg config fsmonitor.idleTimeout -1 &&
+	test_must_fail git -C test_idle_neg fsmonitor--daemon status 2>err &&
+	test_grep "out of range" err
+'
+
 # These tests use the main repo in the trash directory
 
 test_expect_success 'setup' '

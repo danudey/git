@@ -3,6 +3,14 @@ fsmonitor.allowRemote::
     repositories. Setting `fsmonitor.allowRemote` to `true` overrides this
     behavior.  Only respected when `core.fsmonitor` is set to `true`.
 
+fsmonitor.idleTimeout::
+    If set to a positive number of seconds, the fsmonitor daemon
+    shuts itself down when no client has sent it a request for that
+    long. The daemon is started again automatically the next time a
+    Git command needs it. The default is `0`, which means the daemon
+    never times out. Can be overridden with the `--idle-timeout=<n>`
+    option of `git fsmonitor--daemon start` or `run`.
+
 fsmonitor.socketDir::
     This Mac OS and Linux-specific option, if set, specifies the directory in
     which to create the Unix domain socket used for communication

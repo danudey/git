@@ -42,6 +42,9 @@ static int fsmonitor__start_timeout_sec = 60;
 #define FSMONITOR__ANNOUNCE_STARTUP "fsmonitor.announcestartup"
 static int fsmonitor__announce_startup = 0;
 
+#define FSMONITOR__IDLE_TIMEOUT "fsmonitor.idletimeout"
+static int fsmonitor__idle_timeout_sec = 0; /* 0 == never time out */
+
 static int fsmonitor_config(const char *var, const char *value,
 			    const struct config_context *ctx, void *cb)
 {
@@ -70,6 +73,15 @@ static int fsmonitor_config(const char *var, const char *value,
 			return error(_("value of '%s' not bool or int: %d"),
 				     var, i);
 		fsmonitor__announce_startup = i;
+		return 0;
+	}
+
+	if (!strcmp(var, FSMONITOR__IDLE_TIMEOUT)) {
+		int i = git_config_int(var, value, ctx->kvi);
+		if (i < 0)
+			return error(_("value of '%s' out of range: %d"),
+				     FSMONITOR__IDLE_TIMEOUT, i);
+		fsmonitor__idle_timeout_sec = i;
 		return 0;
 	}
 
@@ -976,6 +988,13 @@ cleanup:
 	return 0;
 }
 
+static void idle__touch(struct fsmonitor_daemon_state *state)
+{
+	pthread_mutex_lock(&state->idle_lock);
+	state->last_client_time = time(NULL);
+	pthread_mutex_unlock(&state->idle_lock);
+}
+
 static ipc_server_application_cb handle_client;
 
 static int handle_client(void *data,
@@ -985,6 +1004,8 @@ static int handle_client(void *data,
 {
 	struct fsmonitor_daemon_state *state = data;
 	int result;
+
+	idle__touch(state);
 
 	/*
 	 * The Simple IPC API now supports {char*, len} arguments, but
@@ -1002,6 +1023,9 @@ static int handle_client(void *data,
 	result = do_handle_client(state, command, reply, reply_data);
 
 	trace2_region_leave("fsmonitor", "handle_client", the_repository);
+
+	/* A long-running request should not count as idle time. */
+	idle__touch(state);
 
 	return result;
 }
@@ -1179,6 +1203,58 @@ static void *fsm_health__thread_proc(void *_state)
 	return NULL;
 }
 
+/*
+ * Shut the daemon down once no client has talked to it for
+ * `fsmonitor__idle_timeout_sec` seconds.  Only started when the
+ * timeout is positive.
+ */
+static void *fsm_idle__thread_proc(void *_state)
+{
+	struct fsmonitor_daemon_state *state = _state;
+	int timed_out = 0;
+
+	trace2_thread_start("fsm-idle");
+
+	pthread_mutex_lock(&state->idle_lock);
+	while (!state->idle_stop) {
+		time_t now = time(NULL);
+		time_t deadline = state->last_client_time +
+			fsmonitor__idle_timeout_sec;
+		struct timespec ts;
+
+		if (now >= deadline) {
+			timed_out = 1;
+			break;
+		}
+
+		ts.tv_sec = deadline;
+		ts.tv_nsec = 0;
+		pthread_cond_timedwait(&state->idle_cond, &state->idle_lock,
+				       &ts);
+	}
+	pthread_mutex_unlock(&state->idle_lock);
+
+	if (timed_out) {
+		trace_printf_key(&trace_fsmonitor,
+				 "idle timeout (%ds) reached; shutting down",
+				 fsmonitor__idle_timeout_sec);
+		trace2_data_intmax("fsmonitor", the_repository, "idle_timeout",
+				   fsmonitor__idle_timeout_sec);
+		ipc_server_stop_async(state->ipc_server_data);
+	}
+
+	trace2_thread_exit();
+	return NULL;
+}
+
+static void fsm_idle__stop_async(struct fsmonitor_daemon_state *state)
+{
+	pthread_mutex_lock(&state->idle_lock);
+	state->idle_stop = 1;
+	pthread_cond_signal(&state->idle_cond);
+	pthread_mutex_unlock(&state->idle_lock);
+}
+
 static void *fsm_listen__thread_proc(void *_state)
 {
 	struct fsmonitor_daemon_state *state = _state;
@@ -1219,6 +1295,7 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	};
 	int health_started = 0;
 	int listener_started = 0;
+	int idle_started = 0;
 	int err = 0;
 
 	/*
@@ -1257,6 +1334,21 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	health_started = 1;
 
 	/*
+	 * Optionally start the idle thread to shut us down when no
+	 * client has talked to us for a while.
+	 */
+	if (fsmonitor__idle_timeout_sec > 0) {
+		idle__touch(state);
+		if (pthread_create(&state->idle_thread, NULL,
+				   fsm_idle__thread_proc, state)) {
+			ipc_server_stop_async(state->ipc_server_data);
+			err = error(_("could not start fsmonitor idle thread"));
+			goto cleanup;
+		}
+		idle_started = 1;
+	}
+
+	/*
 	 * The daemon is now fully functional in background threads.
 	 * Our primary thread should now just wait while the threads
 	 * do all the work.
@@ -1283,6 +1375,11 @@ cleanup:
 		pthread_join(state->health_thread, NULL);
 	}
 
+	if (idle_started) {
+		fsm_idle__stop_async(state);
+		pthread_join(state->idle_thread, NULL);
+	}
+
 	if (err)
 		return err;
 	if (state->listen_error_code)
@@ -1303,6 +1400,8 @@ static int fsmonitor_run_daemon(void)
 	hashmap_init(&state.cookies, cookies_cmp, NULL, 0);
 	pthread_mutex_init(&state.main_lock, NULL);
 	pthread_cond_init(&state.cookies_cond, NULL);
+	pthread_mutex_init(&state.idle_lock, NULL);
+	pthread_cond_init(&state.idle_cond, NULL);
 	state.listen_error_code = 0;
 	state.health_error_code = 0;
 	state.current_token_data = fsmonitor_new_token_data();
@@ -1422,6 +1521,8 @@ done:
 	state.current_token_data = NULL;
 	pthread_cond_destroy(&state.cookies_cond);
 	pthread_mutex_destroy(&state.main_lock);
+	pthread_cond_destroy(&state.idle_cond);
+	pthread_mutex_destroy(&state.idle_lock);
 	{
 		struct hashmap_iter iter;
 		struct fsmonitor_cookie_item *cookie;
@@ -1539,6 +1640,7 @@ static int try_to_start_background_daemon(void)
 	strvec_push(&cp.args, "run");
 	strvec_push(&cp.args, "--detach");
 	strvec_pushf(&cp.args, "--ipc-threads=%d", fsmonitor__ipc_threads);
+	strvec_pushf(&cp.args, "--idle-timeout=%d", fsmonitor__idle_timeout_sec);
 
 	cp.no_stdin = 1;
 	cp.no_stdout = 1;
@@ -1582,6 +1684,9 @@ int cmd_fsmonitor__daemon(int argc,
 		OPT_INTEGER(0, "start-timeout",
 			    &fsmonitor__start_timeout_sec,
 			    N_("max seconds to wait for background daemon startup")),
+		OPT_INTEGER(0, "idle-timeout",
+			    &fsmonitor__idle_timeout_sec,
+			    N_("exit after <n> seconds without client requests (0 = never)")),
 
 		OPT_END()
 	};
@@ -1597,6 +1702,9 @@ int cmd_fsmonitor__daemon(int argc,
 	if (fsmonitor__ipc_threads < 1)
 		die(_("invalid 'ipc-threads' value (%d)"),
 		    fsmonitor__ipc_threads);
+	if (fsmonitor__idle_timeout_sec < 0)
+		die(_("invalid 'idle-timeout' value (%d)"),
+		    fsmonitor__idle_timeout_sec);
 
 	prepare_repo_settings(the_repository);
 	/*

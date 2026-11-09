@@ -59,6 +59,17 @@ struct fsmonitor_daemon_state {
 	struct ipc_server_data *ipc_server_data;
 	struct strbuf path_ipc;
 
+	/*
+	 * Idle-timeout support.  `last_client_time` is updated each
+	 * time a client request is handled.  The idle thread shuts
+	 * the daemon down when no client has been seen for
+	 * `fsmonitor.idleTimeout` seconds.  Protected by `idle_lock`.
+	 */
+	pthread_t idle_thread;
+	pthread_mutex_t idle_lock;
+	pthread_cond_t idle_cond;
+	time_t last_client_time;
+	int idle_stop;
 };
 
 /*
